@@ -33,7 +33,7 @@ DAILY_REWARDS = {} # لتخزين وقت آخر مكافأة يومية
 # إعدادات المزود
 CURRENT_PROVIDER = "gemma"  # القيم المتاحة: 'gemma' أو 'google'
 GOOGLE_API_KEYS = []
-GOOGLE_MODEL_NAME = "gemini-2.0-flash" 
+GOOGLE_MODEL_NAME = "gemini-2.5-flash" 
 
 # إحصائيات
 BOT_STATS = {
