@@ -5,7 +5,9 @@ import json
 import asyncio
 import random
 import requests  # للمزود Gemma القديم
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, ChatAction
+# ------------------- تصحيح الاستدعاءات هنا -------------------
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.constants import ChatAction # <-- تم التصحيح هنا
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 import google.generativeai as genai
 from collections import deque
@@ -321,7 +323,7 @@ async def new_story_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------- التشغيل الرئيسي -------------------
 def main():
-    print("🚀 ZEUS AI (Hybrid V4) is Running...")
+    print("🚀 ZEUS AI (Hybrid V4.1 Fixed) is Running...")
     
     app = Application.builder().token(TOKEN).build()
 
