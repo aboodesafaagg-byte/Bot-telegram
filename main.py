@@ -3,6 +3,7 @@ import re
 import random
 import asyncio
 import time
+import logging
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -13,19 +14,26 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 BOT_TOKEN = "8321203989:AAFCZTJx4mYM6DPSy9kQGixSy7XC22ZxmWk"
 ADMIN_USERNAME = "t5lnn"  # معرف المدير للتحكم في البوت
 
+# إعدادات السجلات (Logging) لرؤية الأخطاء بوضوح
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 # ==========================================
 # متغيرات النظام (Global State)
 # ==========================================
 CHAT_HISTORY = {}
 USER_STATE = {}
-USER_CONTEXT = {} # لحفظ اختيارات اللاعب المؤقتة (نوع العالم، طريقة البدء)
+USER_CONTEXT = {} 
 
 # إعدادات المزود (Provider Settings)
 CURRENT_PROVIDER = "gemma" # القيم المتاحة: 'gemma' أو 'google'
-GOOGLE_API_KEYS = [] # قائمة لتخزين مفاتيح جوجل
-GOOGLE_MODEL_NAME = "gemini-2.5-flash" # النموذج المطلوب
+GOOGLE_API_KEYS = [] 
+GOOGLE_MODEL_NAME = "gemini-2.5-flash" 
 
-# إحصائيات بسيطة
+# إحصائيات
 BOT_STATS = {
     "total_users": set(),
     "messages_count": 0
@@ -35,7 +43,6 @@ BOT_STATS = {
 # النصوص التوجيهية (Prompts)
 # ==========================================
 
-# برومبت الراوي (Gemma/Google) للعبة
 RPG_SYSTEM_PROMPT = """
 أنت "ZEUS AI"، راوي قصص تفاعلية (Dungeon Master) متطور جداً.
 قواعدك الصارمة:
@@ -50,7 +57,6 @@ RPG_SYSTEM_PROMPT = """
 9. طريقة بداية اللاعب هي: {start_type}. ابدأ القصة بناءً على هذا الإعداد فوراً.
 """
 
-# برومبت الدردشة العادية
 CHAT_SYSTEM_PROMPT = """
 أنت "ZEUS AI"، مساعد ذكي ومتطور.
 1. تحدث مع المستخدم بشكل طبيعي ومفيد.
@@ -64,12 +70,11 @@ CHAT_SYSTEM_PROMPT = """
 # ==========================================
 
 def clean_markdown(text):
-    """إصلاح مشاكل التنسيق بين الذكاء الاصطناعي وتليجرام"""
     text = text.replace('\\', '')
     text = text.replace('**', '*')
     return text
 
-# --- دالة الاتصال بـ Gemma (المزود الأول) ---
+# --- دالة الاتصال بـ Gemma ---
 def ask_gemma(messages_list, retries=3):
     url = "https://gemma3.cc/api/chat"
     headers = {
@@ -82,7 +87,6 @@ def ask_gemma(messages_list, retries=3):
         "Origin": "https://gemma3.cc"
     }
     
-    # تنظيف الرسائل لتناسب Gemma
     clean_messages = []
     for msg in messages_list:
         clean_messages.append({"role": msg["role"], "content": msg["content"]})
@@ -100,29 +104,23 @@ def ask_gemma(messages_list, retries=3):
                 cleaned_text = raw_text.replace('\\n', '\n').replace('\\"', '"').strip()
                 return clean_markdown(cleaned_text) if cleaned_text else "⚠️ رد فارغ من Gemma."
         except Exception as e:
-            print(f"Gemma Error {attempt+1}: {e}")
+            logger.error(f"Gemma Error {attempt+1}: {e}")
             time.sleep(2)
     return "❌ خادم Gemma مشغول حالياً."
 
-# --- دالة الاتصال بـ Google Gemini (المزود الثاني) ---
+# --- دالة الاتصال بـ Google Gemini ---
 def ask_google(messages_list, retries=3):
     if not GOOGLE_API_KEYS:
         return "⚠️ لم يتم إضافة مفاتيح Google API بعد من قبل الأدمن."
     
-    # اختيار مفتاح عشوائي (توزيع الحمل)
     api_key = random.choice(GOOGLE_API_KEYS)
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GOOGLE_MODEL_NAME}:generateContent?key={api_key}"
     
     headers = {"Content-Type": "application/json"}
     
-    # تحويل صيغة الرسائل لصيغة Google Gemini
     contents = []
-    # دمج تعليمات النظام مع الرسالة الأولى أو إرسالها كسياق (Gemini يفضل System Instruction منفصل أو مدمج)
-    # للتبسيط والكفاءة، سندمج النظام في أول رسالة مستخدم إذا لم يكن مدعوماً مباشرة في الـ HTTP REST البسيط
-    
     for i, msg in enumerate(messages_list):
         role = "user" if msg["role"] == "user" else "model"
-        # Google API يتطلب أن يكون الـ role إما user أو model
         contents.append({
             "role": role,
             "parts": [{"text": msg["content"]}]
@@ -145,17 +143,16 @@ def ask_google(messages_list, retries=3):
                     text = data["candidates"][0]["content"]["parts"][0]["text"]
                     return clean_markdown(text)
                 except KeyError:
-                    return "⚠️ خطأ في قراءة رد Google (بنية غير متوقعة)."
+                    return "⚠️ خطأ في قراءة رد Google."
             else:
-                return f"❌ خطأ من Google: {response.status_code} - {response.text}"
+                return f"❌ خطأ من Google: {response.status_code}"
         except Exception as e:
-            print(f"Google Error {attempt+1}: {e}")
+            logger.error(f"Google Error {attempt+1}: {e}")
             time.sleep(2)
     return "❌ تعذر الاتصال بخوادم Google."
 
-# --- الموجه الذكي (Router) ---
+# --- الموجه الذكي ---
 def ask_ai_unified(messages_list):
-    """دالة موحدة تختار المزود بناءً على إعدادات الأدمن"""
     if CURRENT_PROVIDER == "google":
         return ask_google(messages_list)
     else:
@@ -163,7 +160,6 @@ def ask_ai_unified(messages_list):
 
 # --- أدوات الواجهة ---
 def create_numeric_keyboard(text):
-    """إنشاء أزرار رقمية للخيارات"""
     options_indices = re.findall(r'(\d+)\.', text)
     buttons = []
     if options_indices:
@@ -171,7 +167,7 @@ def create_numeric_keyboard(text):
         row = []
         for opt in unique_options:
             row.append(KeyboardButton(opt))
-            if len(row) == 3: # 3 أزرار في الصف
+            if len(row) == 3:
                 buttons.append(row)
                 row = []
         if row:
@@ -201,21 +197,17 @@ async def send_smart_message(update, text, reply_markup=None):
 # ==========================================
 
 async def show_main_menu(update: Update):
-    """القائمة الرئيسية"""
     welcome_text = (
         "⚡ **أهلاً بك في ZEUS AI** ⚡\n\n"
         "أنا مساعدك الذكي وراوي قصصك المفضل.\n"
         f"💎 **المزود الحالي:** {CURRENT_PROVIDER.upper()}\n"
         "👇 **ماذا تريد أن تفعل اليوم؟**"
     )
-    
     keyboard = [
         [KeyboardButton("⚔️ وضع RPG (لعبة)")],
         [KeyboardButton("💬 وضع الدردشة (Chat)")],
         [KeyboardButton("ℹ️ التعليمات"), KeyboardButton("👤 حسابي")]
     ]
-    
-    # إضافة زر الأدمن فقط للمدير
     if update.effective_user.username == ADMIN_USERNAME:
         keyboard.append([KeyboardButton("⚙️ لوحة التحكم (Admin)")])
 
@@ -223,7 +215,6 @@ async def show_main_menu(update: Update):
     await update.message.reply_text(clean_markdown(welcome_text), parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
 
 async def show_rpg_genres(update: Update):
-    """قائمة اختيار العوالم"""
     text = "🌍 **اختر العالم الذي تريد المغامرة فيه:**"
     keyboard = [
         [KeyboardButton("🐉 شيانشيا (Xianxia)"), KeyboardButton("👊 ووشيا (Wuxia)")],
@@ -235,7 +226,6 @@ async def show_rpg_genres(update: Update):
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
 
 async def show_start_types(update: Update):
-    """قائمة كيفية البداية"""
     text = "✨ **كيف تريد أن تكون بدايتك في هذا العالم؟**"
     keyboard = [
         [KeyboardButton("🖥️ امتلاك نظام (System Cheat)"), KeyboardButton("🥄 ملعقة ذهبية (نبيل/غني)")],
@@ -246,7 +236,7 @@ async def show_start_types(update: Update):
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
 
 # ==========================================
-# لوحة تحكم الأدمن (Admin Panel)
+# لوحة تحكم الأدمن
 # ==========================================
 
 async def show_admin_panel(update: Update):
@@ -260,7 +250,6 @@ async def show_admin_panel(update: Update):
         f"🔑 عدد مفاتيح Google: {len(GOOGLE_API_KEYS)}\n"
         f"🤖 نموذج جوجل: {GOOGLE_MODEL_NAME}"
     )
-    
     keyboard = [
         [KeyboardButton("➕ إضافة مفتاح Google"), KeyboardButton("🔄 تبديل المزود")],
         [KeyboardButton("🗑️ حذف جميع المفاتيح"), KeyboardButton("🏠 القائمة الرئيسية")]
@@ -269,7 +258,15 @@ async def show_admin_panel(update: Update):
     await update.message.reply_text(clean_markdown(status_text), parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
 
 # ==========================================
-# معالجة النصوص والمنطق (Handlers Logic)
+# معالجة الأخطاء (هام جداً)
+# ==========================================
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log the error and send a telegram message to notify the developer."""
+    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+    # لا نرسل رسالة للمستخدم دائماً لتجنب الإزعاج، لكن نسجلها في الكونسول
+
+# ==========================================
+# معالجة النصوص والمنطق
 # ==========================================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -277,28 +274,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.effective_user.username
     text = update.message.text
     
-    # تسجيل المستخدم للإحصائيات
     BOT_STATS['total_users'].add(chat_id)
     BOT_STATS['messages_count'] += 1
 
-    # ==========================
-    # 1. منطق القائمة الرئيسية والأزرار العامة
-    # ==========================
+    # القائمة الرئيسية
     if text == "🏠 القائمة الرئيسية":
         CHAT_HISTORY[chat_id] = []
         USER_STATE[chat_id] = "MENU"
         await show_main_menu(update)
         return
 
-    # منطق الأدمن
+    # الأدمن
     if text == "⚙️ لوحة التحكم (Admin)" and username == ADMIN_USERNAME:
         USER_STATE[chat_id] = "ADMIN_PANEL"
         await show_admin_panel(update)
         return
 
-    # ==========================
-    # 2. منطق لوحة التحكم (ADMIN)
-    # ==========================
+    # منطق لوحة التحكم
     if USER_STATE.get(chat_id) == "ADMIN_PANEL":
         if text == "🔄 تبديل المزود":
             global CURRENT_PROVIDER
@@ -330,7 +322,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if USER_STATE.get(chat_id) == "ADMIN_WAITING_KEY":
         if username == ADMIN_USERNAME:
-            if len(text) > 20: # تحقق بسيط من طول المفتاح
+            if len(text) > 20:
                 GOOGLE_API_KEYS.append(text.strip())
                 await update.message.reply_text(f"✅ تم إضافة المفتاح بنجاح! العدد الحالي: {len(GOOGLE_API_KEYS)}")
                 USER_STATE[chat_id] = "ADMIN_PANEL"
@@ -339,9 +331,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("⚠️ المفتاح يبدو قصيراً جداً، تأكد منه.")
         return
 
-    # ==========================
-    # 3. اختيار الأوضاع (RPG vs Chat)
-    # ==========================
+    # اختيار الأوضاع
     if text == "⚔️ وضع RPG (لعبة)":
         USER_STATE[chat_id] = "RPG_SELECT_GENRE"
         await show_rpg_genres(update)
@@ -353,14 +343,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("💬 **أنت الآن في وضع الدردشة الحرة.**\nتحدث معي بشكل طبيعي!", parse_mode=ParseMode.MARKDOWN)
         return
 
-    # ==========================
-    # 4. إعدادات RPG (العالم والبداية)
-    # ==========================
+    # إعدادات RPG
     if USER_STATE.get(chat_id) == "RPG_SELECT_GENRE":
-        # تنظيف النص من الإيموجي للحفظ
         genre_clean = re.sub(r'[^\w\s]', '', text).strip()
         USER_CONTEXT[chat_id] = {"genre": genre_clean}
-        
         USER_STATE[chat_id] = "RPG_SELECT_START"
         await show_start_types(update)
         return
@@ -372,19 +358,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         start_type_clean = re.sub(r'[^\w\s]', '', text).strip()
-        
-        # تجهيز البرومبت النهائي
         genre = USER_CONTEXT[chat_id].get("genre", "خيال")
-        
         final_system_prompt = RPG_SYSTEM_PROMPT.format(genre=genre, start_type=start_type_clean)
         
-        # بدء اللعبة
         CHAT_HISTORY[chat_id] = [{"role": "user", "content": final_system_prompt}]
         USER_STATE[chat_id] = "RPG_GAME"
         
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         
-        # استدعاء الذكاء الاصطناعي
         loop = asyncio.get_running_loop()
         bot_reply = await loop.run_in_executor(None, ask_ai_unified, CHAT_HISTORY[chat_id])
         
@@ -393,15 +374,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_smart_message(update, bot_reply, reply_markup=markup)
         return
 
-    # ==========================
-    # 5. التفاعل داخل اللعبة (RPG LOOP)
-    # ==========================
+    # التفاعل داخل اللعبة
     if USER_STATE.get(chat_id) == "RPG_GAME":
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         
         CHAT_HISTORY[chat_id].append({"role": "user", "content": text})
         
-        # إدارة الذاكرة (14 رسالة)
         if len(CHAT_HISTORY[chat_id]) > 14:
             sys_msg = CHAT_HISTORY[chat_id][0]
             recent = CHAT_HISTORY[chat_id][-10:]
@@ -415,17 +393,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_smart_message(update, bot_reply, reply_markup=markup)
         return
 
-    # ==========================
-    # 6. التفاعل داخل الدردشة (CHAT LOOP)
-    # ==========================
+    # التفاعل داخل الدردشة
     if USER_STATE.get(chat_id) == "CHAT_MODE":
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         
         CHAT_HISTORY[chat_id].append({"role": "user", "content": text})
         
-        # إدارة الذاكرة للدردشة
         if len(CHAT_HISTORY[chat_id]) > 12:
-            sys_msg = CHAT_HISTORY[chat_id][0] # الحفاظ على الشخصية
+            sys_msg = CHAT_HISTORY[chat_id][0]
             recent = CHAT_HISTORY[chat_id][-8:]
             CHAT_HISTORY[chat_id] = [sys_msg] + recent
 
@@ -433,10 +408,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_reply = await loop.run_in_executor(None, ask_ai_unified, CHAT_HISTORY[chat_id])
         
         CHAT_HISTORY[chat_id].append({"role": "model", "content": bot_reply})
-        await send_smart_message(update, bot_reply) # بدون أزرار رقمية في الدردشة
+        await send_smart_message(update, bot_reply)
         return
         
-    # إذا لم يكن في أي حالة معروفة
     if text == "ℹ️ التعليمات":
         await update.message.reply_text("اختر وضعاً من القائمة لتبدأ. في وضع RPG استخدم الأرقام للاختيار.")
         return
@@ -445,7 +419,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🆔 معرفك: `{chat_id}`\n👤 المستخدم: @{username}", parse_mode=ParseMode.MARKDOWN)
         return
 
-    # رسالة افتراضية
     await update.message.reply_text("الرجاء استخدام الأزرار في القائمة.")
 
 # ==========================================
@@ -461,13 +434,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # التشغيل الرئيسي
 # ==========================================
 if __name__ == "__main__":
-    print("🚀 ZEUS AI (V3.0 Ultimate) is Running...")
+    print("🚀 ZEUS AI (V3.1 Stable) is Running...")
     
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("admin", show_admin_panel)) # اختصار للأدمن
+    app.add_handler(CommandHandler("admin", show_admin_panel))
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # إضافة معالج الأخطاء
+    app.add_error_handler(error_handler)
 
     app.run_polling()
