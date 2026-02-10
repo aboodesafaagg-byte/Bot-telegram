@@ -11,7 +11,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 # ==========================================
 # إعدادات البوت والتوكن
 # ==========================================
-BOT_TOKEN = "8321203989:AAFCZTJx4mYM6DPSy9kQGixSy7XC22ZxmWk"
+BOT_TOKEN = "8321203989:AAEuBmcrOfgL2TWLc5_M3eGzDG-a0PTQWMU"
 ADMIN_USERNAME = "t5lnn"  # معرف المدير للتحكم في البوت
 
 # إعدادات السجلات (Logging) لرؤية الأخطاء بوضوح
