@@ -1,449 +1,360 @@
-import requests
-import re
-import random
-import asyncio
-import time
 import logging
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.constants import ChatAction, ParseMode
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+import os
+import re
+import json
+import asyncio
+import random
+import requests  # للمزود Gemma القديم
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, ChatAction
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+import google.generativeai as genai
+from collections import deque
 
-# ==========================================
-# إعدادات البوت والتوكن
-# ==========================================
-BOT_TOKEN = "8321203989:AAEuBmcrOfgL2TWLc5_M3eGzDG-a0PTQWMU"
-ADMIN_USERNAME = "t5lnn"  # معرف المدير للتحكم في البوت
+# ------------------- التكوين والتوكنات -------------------
+# ضع توكن البوت هنا
+TOKEN = os.getenv("BOT_TOKEN", "8292364018:AAEvovWMM0kUb7d_GpW-6JV-U34Xz0usJPQ")
 
-# إعدادات السجلات (Logging) لرؤية الأخطاء بوضوح
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# قائمة مفاتيح جوجل (سيتم تعبئتها من البوت أو المتغيرات)
+GOOGLE_KEYS = []
+current_key_index = 0  # لتتبع المفتاح الحالي
+
+# إعدادات التسجيل (Log)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==========================================
-# متغيرات النظام (Global State)
-# ==========================================
-CHAT_HISTORY = {}
-USER_STATE = {}
-USER_CONTEXT = {} 
+# ------------------- دوال التخزين (قاعدة البيانات البسيطة) -------------------
+USERS_DB = "users_db.json"
 
-# إعدادات المزود (Provider Settings)
-CURRENT_PROVIDER = "gemma" # القيم المتاحة: 'gemma' أو 'google'
-GOOGLE_API_KEYS = [] 
-GOOGLE_MODEL_NAME = "gemini-2.5-flash" 
+def load_db():
+    try:
+        if os.path.exists(USERS_DB):
+            with open(USERS_DB, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except:
+        pass
+    return {"users": {}, "settings": {"provider": "google"}} # الافتراضي
 
-# إحصائيات
-BOT_STATS = {
-    "total_users": set(),
-    "messages_count": 0
+def save_db(db):
+    with open(USERS_DB, 'w', encoding='utf-8') as f:
+        json.dump(db, f, ensure_ascii=False, indent=4)
+
+db = load_db()
+
+# ------------------- 1. دالة Gemma (الطريقة القديمة - Scraping) -------------------
+def ze_gemma_old(m):
+    """
+    تستخدم الطريقة القديمة عبر requests لموقع gemma3.cc
+    بدون مفاتيح API رسمية.
+    """
+    try:
+        # محاكاة متصفح حقيقي
+        headers = {
+            "User-Agent": random.choice([
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
+                "Mozilla/5.0 (Linux; Android 10; SM-A205U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36"
+            ]),
+            "Content-Type": "application/json",
+            "Referer": "https://gemma3.cc/"
+        }
+        
+        payload = {
+            "model": "gemma-3-27b",
+            "messages": [{"role": "user", "content": m}]
+        }
+
+        r = requests.post("https://gemma3.cc/api/chat", json=payload, headers=headers, timeout=20)
+        
+        if r.status_code == 200:
+            # تنظيف الرد باستخدام Regex كما في الكود القديم
+            t = "".join(re.findall(r'\d+:"([^"]*)"', r.text))
+            cleaned = t.replace('\\n', '\n').replace('\\"', '"').strip()
+            return cleaned if cleaned else "⚠️ وصل رد فارغ من Gemma."
+        else:
+            return f"⚠️ خطأ من المصدر: {r.status_code}"
+    except Exception as e:
+        return f"⚠️ خطأ في الاتصال بـ Gemma: {e}"
+
+# ------------------- 2. دالة Google (مع تدوير المفاتيح) -------------------
+async def get_google_response_rotated(history):
+    """
+    تحاول الإرسال باستخدام المفتاح الحالي، إذا فشل تجرب التالي، وهكذا.
+    """
+    global current_key_index, GOOGLE_KEYS
+    
+    if not GOOGLE_KEYS:
+        return "⚠️ لا توجد مفاتيح Google محفوظة! استخدم /key لإضافة مفاتيح."
+
+    # محاولة الدوران على المفاتيح بعددها
+    attempts = 0
+    max_attempts = len(GOOGLE_KEYS)
+
+    while attempts < max_attempts:
+        key = GOOGLE_KEYS[current_key_index]
+        try:
+            genai.configure(api_key=key)
+            # نستخدم النموذج الفلاش السريع (1.5 هو المستقر حالياً بدلاً من 2.5 غير الموجود)
+            model = genai.GenerativeModel('gemini-2.5-flash')
+            
+            # تحويل التاريخ لصيغة جوجل
+            google_history = []
+            for msg in history:
+                role = "user" if msg['role'] == "user" else "model"
+                google_history.append({"role": role, "parts": [msg['content']]})
+            
+            # نفترض أن آخر رسالة هي السؤال، والباقي تاريخ
+            chat = model.start_chat(history=google_history[:-1])
+            response = await chat.send_message_async(google_history[-1]['parts'][0])
+            
+            return response.text
+            
+        except Exception as e:
+            error_str = str(e)
+            logger.error(f"Key ending in ...{key[-5:]} failed: {error_str}")
+            
+            # إذا كان الخطأ 429 (Too Many Requests) أو خطأ مصادقة، نبدل المفتاح
+            if "429" in error_str or "403" in error_str or "quota" in error_str.lower():
+                # الانتقال للمفتاح التالي
+                current_key_index = (current_key_index + 1) % len(GOOGLE_KEYS)
+                attempts += 1
+                continue # إعادة المحاولة بالمفتاح الجديد
+            else:
+                # خطأ آخر لا علاقة له بالمفتاح (مثل المحتوى الممنوع)
+                return f"⚠️ خطأ غير متعلق بالمفتاح: {error_str}"
+
+    return "❌ فشلت جميع المفاتيح المتوفرة (429 Quota Exceeded). يرجى إضافة مفاتيح جديدة."
+
+# ------------------- منطق البوت والقصص -------------------
+
+# (نفس منطق القصص السابق لضمان عمل الأزرار)
+STORY_DATA = {
+    "start": {
+        "text": "🌌 *بداية المهمة: بروتوكول أوميغا*\n\nتستيقظ في كبسولة تجميد. الإنذارات تضوي باللون الأحمر. الذاكرة مشوشة.",
+        "options": [
+            {"text": "🔍 فحص الحاسوب", "next": "check_pc"},
+            {"text": "🏃 الهروب فوراً", "next": "escape_pod"}
+        ]
+    },
+    "check_pc": {
+        "text": "تفتح السجلات. ترى تحذيراً: 'اكتشاف كائن غريب في القطاع 7'. تسمع صوتاً خلفك...",
+        "options": [
+            {"text": "🔫 استعد للقتال", "next": "fight"},
+            {"text": "🗣️ حاول التواصل", "next": "talk"}
+        ]
+    },
+    "escape_pod": {
+        "text": "تركض نحو كبسولات النجاة. لكن الباب مغلق ويتطلب رمزاً أمنياً.",
+        "options": [
+            {"text": "💻 اختراق الباب", "next": "hack_door"},
+            {"text": "🔨 كسر القفل", "next": "break_lock"}
+        ]
+    },
+    # نهايات بسيطة للتجربة
+    "fight": {"text": "🔚 المجهول كان أقوى منك. انتهت القصة. /story للبدء مجدداً.", "options": []},
+    "talk": {"text": "🔚 الكائن كان ودوداً وأرشدك للمخرج. نجوت! /story للبدء مجدداً.", "options": []},
+    "hack_door": {"text": "🔚 فتحت الباب ونجوت في اللحظة الأخيرة. /story للبدء مجدداً.", "options": []},
+    "break_lock": {"text": "🔚 انطلق الإنذار الأمني وتم القبض عليك. /story للبدء مجدداً.", "options": []}
 }
 
-# ==========================================
-# النصوص التوجيهية (Prompts)
-# ==========================================
-
-RPG_SYSTEM_PROMPT = """
-أنت "ZEUS AI"، راوي قصص تفاعلية (Dungeon Master) متطور جداً.
-قواعدك الصارمة:
-1. أنت لست مجرد بوت، أنت محرك قصصي.
-2. مهمتك: سرد أحداث مشوقة جداً ووضع اللاعب في مواقف تتطلب الاختيار.
-3. التنسيق مطلوب: استخدم الخط العريض للعناوين أو الأشياء المهمة بوضع نجمتين حول الكلمة (مثال: **المهمة**).
-4. في نهاية كل رد، يجب أن تعطي اللاعب خيارات مرقمة واضحة (1. كذا، 2. كذا..).
-5. لا تتخذ القرارات عن اللاعب، توقف وانتظر رده.
-6. إذا اختار اللاعب رقماً، افهم سياق الرقم من رسالتك السابقة وأكمل القصة.
-7. لا تستخدم الرموز الغريبة مثل الشرطات المائلة (\\) في الأسماء.
-8. نوع القصة المحدد هو: {genre}.
-9. طريقة بداية اللاعب هي: {start_type}. ابدأ القصة بناءً على هذا الإعداد فوراً.
-"""
-
-CHAT_SYSTEM_PROMPT = """
-أنت "ZEUS AI"، مساعد ذكي ومتطور.
-1. تحدث مع المستخدم بشكل طبيعي ومفيد.
-2. أجب عن جميع الأسئلة بدقة.
-3. كن ودوداً ومهذباً.
-4. استخدم التنسيق (Bold, List) لجعل الإجابة مقروءة.
-"""
-
-# ==========================================
-# دوال المساعدة والاتصال (Backend Logic)
-# ==========================================
-
-def clean_markdown(text):
-    text = text.replace('\\', '')
-    text = text.replace('**', '*')
-    return text
-
-# --- دالة الاتصال بـ Gemma ---
-def ask_gemma(messages_list, retries=3):
-    url = "https://gemma3.cc/api/chat"
-    headers = {
-        "User-Agent": random.choice([
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15"
-        ]),
-        "Content-Type": "application/json",
-        "Referer": "https://gemma3.cc/",
-        "Origin": "https://gemma3.cc"
-    }
-    
-    clean_messages = []
-    for msg in messages_list:
-        clean_messages.append({"role": msg["role"], "content": msg["content"]})
-
-    payload = {
-        "model": "gemma-3-27b",
-        "messages": clean_messages
-    }
-
-    for attempt in range(retries):
-        try:
-            response = requests.post(url, json=payload, headers=headers, timeout=30)
-            if response.status_code == 200:
-                raw_text = "".join(re.findall(r'\d+:"([^"]*)"', response.text))
-                cleaned_text = raw_text.replace('\\n', '\n').replace('\\"', '"').strip()
-                return clean_markdown(cleaned_text) if cleaned_text else "⚠️ رد فارغ من Gemma."
-        except Exception as e:
-            logger.error(f"Gemma Error {attempt+1}: {e}")
-            time.sleep(2)
-    return "❌ خادم Gemma مشغول حالياً."
-
-# --- دالة الاتصال بـ Google Gemini ---
-def ask_google(messages_list, retries=3):
-    if not GOOGLE_API_KEYS:
-        return "⚠️ لم يتم إضافة مفاتيح Google API بعد من قبل الأدمن."
-    
-    api_key = random.choice(GOOGLE_API_KEYS)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GOOGLE_MODEL_NAME}:generateContent?key={api_key}"
-    
-    headers = {"Content-Type": "application/json"}
-    
-    contents = []
-    for i, msg in enumerate(messages_list):
-        role = "user" if msg["role"] == "user" else "model"
-        contents.append({
-            "role": role,
-            "parts": [{"text": msg["content"]}]
-        })
-
-    payload = {
-        "contents": contents,
-        "generationConfig": {
-            "temperature": 0.9,
-            "maxOutputTokens": 2048
-        }
-    }
-
-    for attempt in range(retries):
-        try:
-            response = requests.post(url, json=payload, headers=headers, timeout=30)
-            if response.status_code == 200:
-                data = response.json()
-                try:
-                    text = data["candidates"][0]["content"]["parts"][0]["text"]
-                    return clean_markdown(text)
-                except KeyError:
-                    return "⚠️ خطأ في قراءة رد Google."
-            else:
-                return f"❌ خطأ من Google: {response.status_code}"
-        except Exception as e:
-            logger.error(f"Google Error {attempt+1}: {e}")
-            time.sleep(2)
-    return "❌ تعذر الاتصال بخوادم Google."
-
-# --- الموجه الذكي ---
-def ask_ai_unified(messages_list):
-    if CURRENT_PROVIDER == "google":
-        return ask_google(messages_list)
-    else:
-        return ask_gemma(messages_list)
-
-# --- أدوات الواجهة ---
-def create_numeric_keyboard(text):
-    options_indices = re.findall(r'(\d+)\.', text)
-    buttons = []
-    if options_indices:
-        unique_options = sorted(list(set(options_indices)), key=int)
-        row = []
-        for opt in unique_options:
-            row.append(KeyboardButton(opt))
-            if len(row) == 3:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
-    
-    buttons.append([KeyboardButton("🏠 القائمة الرئيسية")])
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-async def send_smart_message(update, text, reply_markup=None):
-    max_length = 4000
-    if len(text) <= max_length:
-        try:
-            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
-        except:
-            await update.message.reply_text(text, reply_markup=reply_markup)
-    else:
-        parts = [text[i:i+max_length] for i in range(0, len(text), max_length)]
-        for i, part in enumerate(parts):
-            markup = reply_markup if i == len(parts) - 1 else None
-            try:
-                await update.message.reply_text(part, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
-            except:
-                await update.message.reply_text(part, reply_markup=markup)
-
-# ==========================================
-# قوائم وأزرار التنقل
-# ==========================================
-
-async def show_main_menu(update: Update):
-    welcome_text = (
-        "⚡ **أهلاً بك في ZEUS AI** ⚡\n\n"
-        "أنا مساعدك الذكي وراوي قصصك المفضل.\n"
-        f"💎 **المزود الحالي:** {CURRENT_PROVIDER.upper()}\n"
-        "👇 **ماذا تريد أن تفعل اليوم؟**"
-    )
-    keyboard = [
-        [KeyboardButton("⚔️ وضع RPG (لعبة)")],
-        [KeyboardButton("💬 وضع الدردشة (Chat)")],
-        [KeyboardButton("ℹ️ التعليمات"), KeyboardButton("👤 حسابي")]
-    ]
-    if update.effective_user.username == ADMIN_USERNAME:
-        keyboard.append([KeyboardButton("⚙️ لوحة التحكم (Admin)")])
-
-    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text(clean_markdown(welcome_text), parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
-
-async def show_rpg_genres(update: Update):
-    text = "🌍 **اختر العالم الذي تريد المغامرة فيه:**"
-    keyboard = [
-        [KeyboardButton("🐉 شيانشيا (Xianxia)"), KeyboardButton("👊 ووشيا (Wuxia)")],
-        [KeyboardButton("🧟 رعب (Apocalypse)"), KeyboardButton("🚀 خيال علمي (Sci-Fi)")],
-        [KeyboardButton("🏰 عصور وسطى (Fantasy)"), KeyboardButton("🌃 سايبر بانك (Cyberpunk)")],
-        [KeyboardButton("🏠 القائمة الرئيسية")]
-    ]
-    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
-
-async def show_start_types(update: Update):
-    text = "✨ **كيف تريد أن تكون بدايتك في هذا العالم؟**"
-    keyboard = [
-        [KeyboardButton("🖥️ امتلاك نظام (System Cheat)"), KeyboardButton("🥄 ملعقة ذهبية (نبيل/غني)")],
-        [KeyboardButton("✨ هالة بطل (Protagonist Halo)"), KeyboardButton("👤 شخصية إضافية (Mob/Extra)")],
-        [KeyboardButton("🎲 بداية عشوائية (Random)"), KeyboardButton("🔙 رجوع")]
-    ]
-    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
-
-# ==========================================
-# لوحة تحكم الأدمن
-# ==========================================
-
-async def show_admin_panel(update: Update):
-    if update.effective_user.username != ADMIN_USERNAME:
-        return
-    
-    status_text = (
-        "⚙️ **لوحة تحكم المدير (Zeus Control)**\n\n"
-        f"📊 عدد المستخدمين: {len(BOT_STATS['total_users'])}\n"
-        f"📡 المزود الحالي: **{CURRENT_PROVIDER}**\n"
-        f"🔑 عدد مفاتيح Google: {len(GOOGLE_API_KEYS)}\n"
-        f"🤖 نموذج جوجل: {GOOGLE_MODEL_NAME}"
-    )
-    keyboard = [
-        [KeyboardButton("➕ إضافة مفتاح Google"), KeyboardButton("🔄 تبديل المزود")],
-        [KeyboardButton("🗑️ حذف جميع المفاتيح"), KeyboardButton("🏠 القائمة الرئيسية")]
-    ]
-    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text(clean_markdown(status_text), parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
-
-# ==========================================
-# معالجة الأخطاء (هام جداً)
-# ==========================================
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log the error and send a telegram message to notify the developer."""
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
-    # لا نرسل رسالة للمستخدم دائماً لتجنب الإزعاج، لكن نسجلها في الكونسول
-
-# ==========================================
-# معالجة النصوص والمنطق
-# ==========================================
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    username = update.effective_user.username
-    text = update.message.text
-    
-    BOT_STATS['total_users'].add(chat_id)
-    BOT_STATS['messages_count'] += 1
-
-    # القائمة الرئيسية
-    if text == "🏠 القائمة الرئيسية":
-        CHAT_HISTORY[chat_id] = []
-        USER_STATE[chat_id] = "MENU"
-        await show_main_menu(update)
-        return
-
-    # الأدمن
-    if text == "⚙️ لوحة التحكم (Admin)" and username == ADMIN_USERNAME:
-        USER_STATE[chat_id] = "ADMIN_PANEL"
-        await show_admin_panel(update)
-        return
-
-    # منطق لوحة التحكم
-    if USER_STATE.get(chat_id) == "ADMIN_PANEL":
-        if text == "🔄 تبديل المزود":
-            global CURRENT_PROVIDER
-            CURRENT_PROVIDER = "google" if CURRENT_PROVIDER == "gemma" else "gemma"
-            await update.message.reply_text(f"✅ تم تغيير المزود إلى: **{CURRENT_PROVIDER}**", parse_mode=ParseMode.MARKDOWN)
-            await show_admin_panel(update)
-            return
-        
-        elif text == "➕ إضافة مفتاح Google":
-            USER_STATE[chat_id] = "ADMIN_WAITING_KEY"
-            instructions = (
-                "🔑 **إضافة مفتاح Google Gemini**\n\n"
-                "أرسل المفتاح الآن في رسالة.\n\n"
-                "📌 **كيف تحصل على المفتاح؟**\n"
-                "1. اذهب إلى Google AI Studio.\n"
-                "2. اضغط Get API Key.\n"
-                "3. انسخ المفتاح وأرسله هنا.\n\n"
-                "🔗 [اضغط هنا لفتح Google Studio](https://aistudio.google.com/app/apikey)\n"
-                "🎥 أو ابحث في يوتيوب: 'How to get Gemini API Key'"
-            )
-            await update.message.reply_text(instructions, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-            return
-
-        elif text == "🗑️ حذف جميع المفاتيح":
-            GOOGLE_API_KEYS.clear()
-            await update.message.reply_text("🗑️ تم حذف جميع المفاتيح.", parse_mode=ParseMode.MARKDOWN)
-            await show_admin_panel(update)
-            return
-
-    if USER_STATE.get(chat_id) == "ADMIN_WAITING_KEY":
-        if username == ADMIN_USERNAME:
-            if len(text) > 20:
-                GOOGLE_API_KEYS.append(text.strip())
-                await update.message.reply_text(f"✅ تم إضافة المفتاح بنجاح! العدد الحالي: {len(GOOGLE_API_KEYS)}")
-                USER_STATE[chat_id] = "ADMIN_PANEL"
-                await show_admin_panel(update)
-            else:
-                await update.message.reply_text("⚠️ المفتاح يبدو قصيراً جداً، تأكد منه.")
-        return
-
-    # اختيار الأوضاع
-    if text == "⚔️ وضع RPG (لعبة)":
-        USER_STATE[chat_id] = "RPG_SELECT_GENRE"
-        await show_rpg_genres(update)
-        return
-    
-    if text == "💬 وضع الدردشة (Chat)":
-        USER_STATE[chat_id] = "CHAT_MODE"
-        CHAT_HISTORY[chat_id] = [{"role": "user", "content": CHAT_SYSTEM_PROMPT}, {"role": "model", "content": "مرحباً! أنا ZEUS، كيف يمكنني مساعدتك اليوم؟"}]
-        await update.message.reply_text("💬 **أنت الآن في وضع الدردشة الحرة.**\nتحدث معي بشكل طبيعي!", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    # إعدادات RPG
-    if USER_STATE.get(chat_id) == "RPG_SELECT_GENRE":
-        genre_clean = re.sub(r'[^\w\s]', '', text).strip()
-        USER_CONTEXT[chat_id] = {"genre": genre_clean}
-        USER_STATE[chat_id] = "RPG_SELECT_START"
-        await show_start_types(update)
-        return
-
-    if USER_STATE.get(chat_id) == "RPG_SELECT_START":
-        if text == "🔙 رجوع":
-            USER_STATE[chat_id] = "RPG_SELECT_GENRE"
-            await show_rpg_genres(update)
-            return
-
-        start_type_clean = re.sub(r'[^\w\s]', '', text).strip()
-        genre = USER_CONTEXT[chat_id].get("genre", "خيال")
-        final_system_prompt = RPG_SYSTEM_PROMPT.format(genre=genre, start_type=start_type_clean)
-        
-        CHAT_HISTORY[chat_id] = [{"role": "user", "content": final_system_prompt}]
-        USER_STATE[chat_id] = "RPG_GAME"
-        
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        
-        loop = asyncio.get_running_loop()
-        bot_reply = await loop.run_in_executor(None, ask_ai_unified, CHAT_HISTORY[chat_id])
-        
-        CHAT_HISTORY[chat_id].append({"role": "model", "content": bot_reply})
-        markup = create_numeric_keyboard(bot_reply)
-        await send_smart_message(update, bot_reply, reply_markup=markup)
-        return
-
-    # التفاعل داخل اللعبة
-    if USER_STATE.get(chat_id) == "RPG_GAME":
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        
-        CHAT_HISTORY[chat_id].append({"role": "user", "content": text})
-        
-        if len(CHAT_HISTORY[chat_id]) > 14:
-            sys_msg = CHAT_HISTORY[chat_id][0]
-            recent = CHAT_HISTORY[chat_id][-10:]
-            CHAT_HISTORY[chat_id] = [sys_msg] + recent
-
-        loop = asyncio.get_running_loop()
-        bot_reply = await loop.run_in_executor(None, ask_ai_unified, CHAT_HISTORY[chat_id])
-        
-        CHAT_HISTORY[chat_id].append({"role": "model", "content": bot_reply})
-        markup = create_numeric_keyboard(bot_reply)
-        await send_smart_message(update, bot_reply, reply_markup=markup)
-        return
-
-    # التفاعل داخل الدردشة
-    if USER_STATE.get(chat_id) == "CHAT_MODE":
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        
-        CHAT_HISTORY[chat_id].append({"role": "user", "content": text})
-        
-        if len(CHAT_HISTORY[chat_id]) > 12:
-            sys_msg = CHAT_HISTORY[chat_id][0]
-            recent = CHAT_HISTORY[chat_id][-8:]
-            CHAT_HISTORY[chat_id] = [sys_msg] + recent
-
-        loop = asyncio.get_running_loop()
-        bot_reply = await loop.run_in_executor(None, ask_ai_unified, CHAT_HISTORY[chat_id])
-        
-        CHAT_HISTORY[chat_id].append({"role": "model", "content": bot_reply})
-        await send_smart_message(update, bot_reply)
-        return
-        
-    if text == "ℹ️ التعليمات":
-        await update.message.reply_text("اختر وضعاً من القائمة لتبدأ. في وضع RPG استخدم الأرقام للاختيار.")
-        return
-        
-    if text == "👤 حسابي":
-        await update.message.reply_text(f"🆔 معرفك: `{chat_id}`\n👤 المستخدم: @{username}", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    await update.message.reply_text("الرجاء استخدام الأزرار في القائمة.")
-
-# ==========================================
-# دالة البدء
-# ==========================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    CHAT_HISTORY[chat_id] = []
-    USER_STATE[chat_id] = "MENU"
-    await show_main_menu(update)
-
-# ==========================================
-# التشغيل الرئيسي
-# ==========================================
-if __name__ == "__main__":
-    print("🚀 ZEUS AI (V3.1 Stable) is Running...")
+    user = update.effective_user
+    uid = str(user.id)
     
-    app = Application.builder().token(BOT_TOKEN).build()
+    if uid not in db["users"]:
+        db["users"][uid] = {"mode": "chat", "history": []}
+        save_db(db)
 
+    keyboard = [
+        [InlineKeyboardButton("💬 وضع الدردشة", callback_data="mode_chat"),
+         InlineKeyboardButton("📖 قصة تفاعلية", callback_data="mode_story")],
+        [InlineKeyboardButton("⚙️ لوحة التحكم", callback_data="admin_panel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"⚡ **أهلاً بك في ZEUS AI** ⚡\n\nأنا مساعدك الذكي وراوي قصصك المفضل.\n💎 **المزود الحالي:** {db['settings']['provider'].upper()}\n👇 **ماذا تريد أن تفعل اليوم؟**",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    uid = str(query.from_user.id)
+
+    if data == "mode_chat":
+        db["users"][uid]["mode"] = "chat"
+        save_db(db)
+        await query.edit_message_text("💬 **أنت الآن في وضع الدردشة الحرة.**\nتحدث معي بشكل طبيعي!")
+
+    elif data == "mode_story":
+        db["users"][uid]["mode"] = "story"
+        db["users"][uid]["story_node"] = "start"
+        save_db(db)
+        # بدء القصة
+        node = STORY_DATA["start"]
+        buttons = [[InlineKeyboardButton(opt["text"], callback_data=f"story:{opt['next']}")] for opt in node["options"]]
+        await query.edit_message_text(node["text"], reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("story:"):
+        next_node_key = data.split(":")[1]
+        node = STORY_DATA.get(next_node_key, STORY_DATA["start"])
+        
+        buttons = []
+        if node["options"]:
+            buttons = [[InlineKeyboardButton(opt["text"], callback_data=f"story:{opt['next']}")] for opt in node["options"]]
+        
+        await query.edit_message_text(node["text"], reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data == "admin_panel":
+        if str(query.from_user.id) not in db["users"]: # يمكن تقييدها بالآدمن الحقيقي
+             pass 
+        
+        count = len(db["users"])
+        provider = db["settings"]["provider"]
+        keys_count = len(GOOGLE_KEYS)
+        
+        text = (
+            f"⚙️ **لوحة تحكم المدير (Zeus Control)**\n\n"
+            f"📊 عدد المستخدمين: {count}\n"
+            f"📡 المزود الحالي: **{provider}**\n"
+            f"🔑 عدد مفاتيح Google: {keys_count}\n\n"
+            "لتبديل المزود اضغط أدناه:"
+        )
+        buttons = [
+            [InlineKeyboardButton("Gemma (مجاني/قديم)", callback_data="set_gemma"),
+             InlineKeyboardButton("Google (رسمي/مفاتيح)", callback_data="set_google")],
+            [InlineKeyboardButton("🔙 عودة", callback_data="mode_chat")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+
+    elif data == "set_gemma":
+        db["settings"]["provider"] = "gemma"
+        save_db(db)
+        await query.answer("تم التبديل إلى Gemma (النظام القديم) ✅")
+        await handle_callback(update, context) # تحديث اللوحة
+
+    elif data == "set_google":
+        db["settings"]["provider"] = "google"
+        save_db(db)
+        await query.answer("تم التبديل إلى Google API ✅")
+        await handle_callback(update, context) # تحديث اللوحة
+
+async def add_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    أمر لإضافة مفاتيح API. يقبل أسطر متعددة.
+    """
+    text = update.message.text.replace("/key", "").strip()
+    
+    if not text:
+        await update.message.reply_text("❌ الرجاء إرسال المفاتيح بعد الأمر.\nمثال:\n/key AIzaSy...\nAIzaSy2...")
+        return
+
+    # تقسيم النص إلى أسطر وتنظيف الفراغات
+    new_keys = [k.strip() for k in text.split('\n') if k.strip()]
+    
+    if not new_keys:
+        return
+
+    global GOOGLE_KEYS
+    GOOGLE_KEYS.extend(new_keys)
+    
+    await update.message.reply_text(f"✅ تم إضافة {len(new_keys)} مفتاح/مفاتيح بنجاح!\nالعدد الكلي الآن: {len(GOOGLE_KEYS)}")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_msg = update.message.text
+    uid = str(update.effective_user.id)
+    
+    # التأكد من وجود المستخدم في قاعدة البيانات
+    if uid not in db["users"]:
+        db["users"][uid] = {"mode": "chat", "history": []}
+
+    mode = db["users"][uid].get("mode", "chat")
+
+    # إذا كان في وضع القصة، نتجاهل النص (يعتمد على الأزرار) أو نحوله لدردشة
+    if mode == "story":
+        await update.message.reply_text("⚠️ أنت في وضع القصة. استخدم الأزرار أو اضغط /start للخروج.")
+        return
+
+    # إظهار "جاري الكتابة..."
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
+    # تجهيز التاريخ (لجوجل فقط، جيما القديم لا يدعم الذاكرة الطويلة جيداً بهذه الطريقة)
+    history = db["users"][uid]["history"]
+    history.append({"role": "user", "content": user_msg})
+    # نحتفظ بآخر 10 رسائل فقط للذاكرة
+    if len(history) > 10: 
+        history = history[-10:]
+
+    provider = db["settings"]["provider"]
+    response_text = ""
+
+    if provider == "gemma":
+        # 🟢 استخدام الطريقة القديمة (بدون مفاتيح)
+        # تشغيل الدالة في Thread منفصل لعدم تجميد البوت
+        loop = asyncio.get_running_loop()
+        # نرسل فقط آخر رسالة لأن النظام القديم لا يدعم التاريخ المعقد
+        response_text = await loop.run_in_executor(None, ze_gemma_old, user_msg)
+    
+    else:
+        # 🔵 استخدام Google API (مع التدوير)
+        response_text = await get_google_response_rotated(history)
+
+    # حفظ الرد في التاريخ
+    history.append({"role": "model", "content": response_text})
+    db["users"][uid]["history"] = history
+    save_db(db)
+
+    await update.message.reply_text(response_text, parse_mode=None) # parse_mode=None لتجنب أخطاء التنسيق
+
+async def new_story_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # اختصار لبدء القصة
+    uid = str(update.effective_user.id)
+    db["users"][uid]["mode"] = "story"
+    db["users"][uid]["story_node"] = "start"
+    save_db(db)
+    
+    node = STORY_DATA["start"]
+    buttons = [[InlineKeyboardButton(opt["text"], callback_data=f"story:{opt['next']}")] for opt in node["options"]]
+    await update.message.reply_text(node["text"], reply_markup=InlineKeyboardMarkup(buttons))
+
+# ------------------- التشغيل الرئيسي -------------------
+def main():
+    print("🚀 ZEUS AI (Hybrid V4) is Running...")
+    
+    app = Application.builder().token(TOKEN).build()
+
+    # الأوامر
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("admin", show_admin_panel))
+    app.add_handler(CommandHandler("key", add_key_command)) # إضافة المفاتيح
+    app.add_handler(CommandHandler("new", new_story_command))
     
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # إضافة معالج الأخطاء
-    app.add_error_handler(error_handler)
+    # المعالجات
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    app.run_polling()
+    # اكتشاف البيئة (Railway vs Local)
+    if "PORT" in os.environ:
+        port = int(os.environ.get("PORT", "8080"))
+        webhook_url = os.environ.get("RAILWAY_PUBLIC_DOMAIN") # أو رابطك الخاص
+        if webhook_url:
+            if not webhook_url.startswith("https://"):
+                webhook_url = "https://" + webhook_url
+            app.run_webhook(
+                listen="0.0.0.0",
+                port=port,
+                url_path=TOKEN,
+                webhook_url=f"{webhook_url}/{TOKEN}"
+            )
+        else:
+            # حالة نادرة في railway بدون دومين
+            app.run_polling()
+    else:
+        # تشغيل محلي
+        app.run_polling()
+
+if __name__ == "__main__":
+    import nest_asyncio
+    nest_asyncio.apply()
+    main()
