@@ -23,7 +23,7 @@ USER_CONTEXT = {} # لحفظ اختيارات اللاعب المؤقتة (نو�
 # إعدادات المزود (Provider Settings)
 CURRENT_PROVIDER = "gemma" # القيم المتاحة: 'gemma' أو 'google'
 GOOGLE_API_KEYS = [] # قائمة لتخزين مفاتيح جوجل
-GOOGLE_MODEL_NAME = "gemini-2.0-flash" # النموذج المطلوب
+GOOGLE_MODEL_NAME = "gemini-2.5-flash" # النموذج المطلوب
 
 # إحصائيات بسيطة
 BOT_STATS = {
